@@ -1,0 +1,5 @@
+# Rename this file to CODEOWNERS at the repository root, or to .github/CODEOWNERS.
+# Replace @chwaee with the people who must approve changes.
+
+* @chwaee
+/.github/ @chwaee

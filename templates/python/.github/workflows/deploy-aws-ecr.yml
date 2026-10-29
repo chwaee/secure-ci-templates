@@ -1,0 +1,220 @@
+name: Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+  ECS_TASK_DEFINITION: ${{ vars.ECS_TASK_DEFINITION || 'ecs/task-definition.json' }}
+  ECS_CONTAINER_NAME: ${{ vars.ECS_CONTAINER_NAME }}
+  TRIVY_FAIL_SEVERITY: ${{ vars.TRIVY_FAIL_SEVERITY || 'CRITICAL,HIGH' }}
+  TRIVY_WARN_SEVERITY: ${{ vars.TRIVY_WARN_SEVERITY || 'MEDIUM' }}
+  TRIVY_IGNORE_UNFIXED: ${{ vars.TRIVY_IGNORE_UNFIXED || 'false' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require deploy settings
+        run: |
+          missing=0
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::Set repository variable AWS_ROLE_ARN before deploying."
+            missing=1
+          fi
+          if [ -z "$ECR_REPOSITORY" ]; then
+            echo "::error::Set repository variable ECR_REPOSITORY before deploying."
+            missing=1
+          fi
+          if [ -z "$ECS_CLUSTER" ]; then
+            echo "::error::Set repository variable ECS_CLUSTER before deploying."
+            missing=1
+          fi
+          if [ -z "$ECS_SERVICE" ]; then
+            echo "::error::Set repository variable ECS_SERVICE before deploying."
+            missing=1
+          fi
+          if [ -z "$ECS_CONTAINER_NAME" ]; then
+            echo "::error::Set repository variable ECS_CONTAINER_NAME before deploying."
+            missing=1
+          fi
+          if [ ! -f "$ECS_TASK_DEFINITION" ]; then
+            echo "::error::Create $ECS_TASK_DEFINITION before the first deploy. Start from templates/ecs/task-definition.json.example."
+            missing=1
+          fi
+          if [ ! -f Dockerfile ]; then
+            echo "::error::Add a Dockerfile at the repository root before deploying."
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Tag the image for the scan
+        id: tag
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          first=$(printf '%s\n' "$TAGS" | head -n 1)
+          if [ -z "$first" ]; then
+            echo "::error::The metadata action produced no tags."
+            exit 1
+          fi
+          docker tag "$first" local-scan:ci
+          echo "first=$first" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: local-scan:ci
+          scanners: vuln,secret
+          severity: MEDIUM,HIGH,CRITICAL
+          format: json
+          output: trivy-image.json
+          exit-code: "0"
+          ignore-unfixed: ${{ env.TRIVY_IGNORE_UNFIXED }}
+          version: v0.70.0
+
+      - name: Enforce Trivy severity
+        env:
+          TRIVY_REPORT: trivy-image.json
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          fail = {s.strip().upper() for s in os.environ.get("TRIVY_FAIL_SEVERITY", "CRITICAL,HIGH").split(",") if s.strip()}
+          warn = {s.strip().upper() for s in os.environ.get("TRIVY_WARN_SEVERITY", "MEDIUM").split(",") if s.strip()}
+          path = os.environ.get("TRIVY_REPORT", "trivy.json")
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  report = json.load(handle)
+          except FileNotFoundError:
+              print(f"::error::Trivy did not write {path}")
+              sys.exit(1)
+          except json.JSONDecodeError as exc:
+              print(f"::error::Trivy report is not JSON: {exc}")
+              sys.exit(1)
+
+          if isinstance(report, dict):
+              results = report.get("Results") or []
+          elif isinstance(report, list):
+              results = report
+          else:
+              results = []
+
+          blocking = []
+          warnings = []
+          for result in results:
+              target = result.get("Target", "")
+              for vuln in result.get("Vulnerabilities") or []:
+                  sev = (vuln.get("Severity") or "").upper()
+                  line = f"{sev} {vuln.get('VulnerabilityID', '')} {vuln.get('PkgName', '')} ({target})"
+                  if sev in fail:
+                      blocking.append(line)
+                  elif sev in warn:
+                      warnings.append(line)
+              for secret in result.get("Secrets") or []:
+                  title = secret.get("Title") or secret.get("RuleID") or "secret"
+                  sev = (secret.get("Severity") or "HIGH").upper()
+                  blocking.append(f"secret {sev} {title} ({target})")
+
+          for line in warnings:
+              print(f"::warning::{line}")
+          for line in blocking:
+              print(f"::error::{line}")
+          if not blocking and not warnings:
+              print("Trivy found nothing at medium or above. A clean scan on a project with no dependency manifest is a pass.")
+          if blocking:
+              sys.exit(1)
+          PY
+
+      - name: Push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+
+      - name: Render the task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@8d79160660ad39c402a16e5fc7cd2a32e8f7d6b7 # v1.9.1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.ECS_CONTAINER_NAME }}
+          image: ${{ steps.tag.outputs.first }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@a00d4d57ac0de1a99b39fe469f3d898d38717c2b # v2.6.4
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true

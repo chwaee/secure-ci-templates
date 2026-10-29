@@ -1,0 +1,26 @@
+name: Docker
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/reusable-image.yml
+    with:
+      push: ${{ github.event_name != 'pull_request' }}
+      fail_severity: ${{ vars.TRIVY_FAIL_SEVERITY || 'CRITICAL,HIGH' }}
+    secrets: inherit

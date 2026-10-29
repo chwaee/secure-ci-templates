@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_WORKING_DIR: ${{ vars.TF_WORKING_DIR || '.' }}
+  TERRAFORM_VERSION: ${{ vars.TERRAFORM_VERSION || '1.17.1' }}
+  TFLINT_VERSION: ${{ vars.TFLINT_VERSION || 'v0.65.0' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Lint (terraform fmt -recursive fixes this)
+        id: lint
+        run: |
+          cd "$TF_WORKING_DIR"
+          terraform fmt -check -recursive
+
+      - name: Validate
+        run: |
+          cd "$TF_WORKING_DIR"
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: Set up tflint
+        uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: tflint
+        run: |
+          cd "$TF_WORKING_DIR"
+          if [ ! -f .tflint.hcl ]; then
+            python3 -c 'from pathlib import Path; Path(".tflint.hcl").write_text("plugin \"aws\" {\n  enabled = true\n  version = \"0.50.0\"\n  source  = \"github.com/terraform-linters/tflint-ruleset-aws\"\n}\n")'
+          fi
+          tflint --init
+          tflint --recursive
+
+      - name: Install tfsec
+        run: |
+          version=1.28.14
+          curl -fsSL -o tfsec.tar.gz "https://github.com/aquasecurity/tfsec/releases/download/v${version}/tfsec_${version}_linux_amd64.tar.gz"
+          curl -fsSL -o tfsec_checksums.txt "https://github.com/aquasecurity/tfsec/releases/download/v${version}/tfsec_${version}_checksums.txt"
+          grep "tfsec_${version}_linux_amd64.tar.gz" tfsec_checksums.txt | sha256sum -c -
+          tar -xzf tfsec.tar.gz tfsec
+          sudo mv tfsec /usr/local/bin/tfsec
+
+      - name: tfsec high (blocking)
+        id: security
+        run: |
+          cd "$TF_WORKING_DIR"
+          tfsec --minimum-severity HIGH .
+
+      - name: tfsec medium (warning)
+        if: success()
+        run: |
+          cd "$TF_WORKING_DIR"
+          tfsec --minimum-severity MEDIUM --soft-fail .
+
+      - name: Comment on the pull request
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          SECURITY_OUTCOME: ${{ steps.security.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const marker = "<!-- secure-ci-templates:ci -->";
+            const body = [
+              marker,
+              "## Terraform CI",
+              "",
+              `| Lint | ${process.env.LINT_OUTCOME} |`,
+              `| tfsec | ${process.env.SECURITY_OUTCOME} |`,
+              "",
+              `[Run](${process.env.RUN_URL})`,
+            ].join("\n");
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => (comment.body || "").includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

@@ -1,0 +1,29 @@
+name: Close stale pull requests
+
+on:
+  schedule:
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # days-before-pr-close is the wait after the stale label, not the total age.
+      # 30 days until stale, then 30 more days, closes the pull request at 60 days.
+      - name: Mark and close stale pull requests
+        uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+          days-before-pr-stale: 30
+          days-before-pr-close: 30
+          exempt-draft-pr: true
+          exempt-pr-labels: security,keep
+          stale-pr-message: This pull request has had no activity for 30 days. It will close after another 30 days with no activity.
+          close-pr-message: Closed after 60 days without activity.

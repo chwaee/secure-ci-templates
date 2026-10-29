@@ -1,0 +1,188 @@
+name: Image
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: Image name without a registry. Defaults to the repository name.
+        required: false
+        type: string
+        default: ""
+      push:
+        description: Push to ghcr.io after the scan
+        required: false
+        type: boolean
+        default: false
+      fail_severity:
+        description: Trivy severities that fail the job. Empty uses CRITICAL,HIGH.
+        required: false
+        type: string
+        default: ""
+    outputs:
+      image:
+        description: Image reference that was built
+        value: ${{ jobs.build.outputs.image }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      image: ${{ steps.tag.outputs.first }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require a Dockerfile
+        run: |
+          if [ ! -f Dockerfile ]; then
+            echo "::error::Add a Dockerfile at the repository root. Start from Dockerfile.python-base, Dockerfile.node-base, or Dockerfile.go-base."
+            exit 1
+          fi
+
+      - name: Image name
+        id: image
+        env:
+          INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+        run: |
+          if [ -n "$INPUT_IMAGE_NAME" ]; then
+            name=$(printf '%s' "$INPUT_IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          else
+            name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          fi
+          echo "name=ghcr.io/${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Tag the image for the scan
+        id: tag
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          first=$(printf '%s\n' "$TAGS" | head -n 1)
+          if [ -z "$first" ]; then
+            echo "::error::The metadata action produced no tags."
+            exit 1
+          fi
+          docker tag "$first" local-scan:ci
+          echo "first=$first" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_FAIL_SEVERITY: ${{ inputs.fail_severity || 'CRITICAL,HIGH' }}
+        with:
+          scan-type: image
+          image-ref: local-scan:ci
+          scanners: vuln,secret
+          severity: MEDIUM,HIGH,CRITICAL
+          format: json
+          output: trivy-image.json
+          exit-code: "0"
+          ignore-unfixed: ${{ vars.TRIVY_IGNORE_UNFIXED || 'false' }}
+          version: v0.70.0
+
+      - name: Enforce Trivy severity
+        env:
+          TRIVY_FAIL_SEVERITY: ${{ inputs.fail_severity || 'CRITICAL,HIGH' }}
+          TRIVY_WARN_SEVERITY: ${{ vars.TRIVY_WARN_SEVERITY || 'MEDIUM' }}
+          TRIVY_REPORT: trivy-image.json
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          fail = {s.strip().upper() for s in os.environ.get("TRIVY_FAIL_SEVERITY", "CRITICAL,HIGH").split(",") if s.strip()}
+          warn = {s.strip().upper() for s in os.environ.get("TRIVY_WARN_SEVERITY", "MEDIUM").split(",") if s.strip()}
+          path = os.environ.get("TRIVY_REPORT", "trivy.json")
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  report = json.load(handle)
+          except FileNotFoundError:
+              print(f"::error::Trivy did not write {path}")
+              sys.exit(1)
+          except json.JSONDecodeError as exc:
+              print(f"::error::Trivy report is not JSON: {exc}")
+              sys.exit(1)
+
+          if isinstance(report, dict):
+              results = report.get("Results") or []
+          elif isinstance(report, list):
+              results = report
+          else:
+              results = []
+
+          blocking = []
+          warnings = []
+          for result in results:
+              target = result.get("Target", "")
+              for vuln in result.get("Vulnerabilities") or []:
+                  sev = (vuln.get("Severity") or "").upper()
+                  line = f"{sev} {vuln.get('VulnerabilityID', '')} {vuln.get('PkgName', '')} ({target})"
+                  if sev in fail:
+                      blocking.append(line)
+                  elif sev in warn:
+                      warnings.append(line)
+              for secret in result.get("Secrets") or []:
+                  title = secret.get("Title") or secret.get("RuleID") or "secret"
+                  sev = (secret.get("Severity") or "HIGH").upper()
+                  blocking.append(f"secret {sev} {title} ({target})")
+
+          for line in warnings:
+              print(f"::warning::{line}")
+          for line in blocking:
+              print(f"::error::{line}")
+          if not blocking and not warnings:
+              print("Trivy found nothing at medium or above. A clean scan on a project with no dependency manifest is a pass.")
+          if blocking:
+              sys.exit(1)
+          PY
+
+      - name: Log in to GHCR
+        if: inputs.push
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: inputs.push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

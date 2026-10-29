@@ -1,0 +1,291 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: ${{ vars.NODE_VERSION || '26.13.0' }}
+  TRIVY_FAIL_SEVERITY: ${{ vars.TRIVY_FAIL_SEVERITY || 'CRITICAL,HIGH' }}
+  TRIVY_WARN_SEVERITY: ${{ vars.TRIVY_WARN_SEVERITY || 'MEDIUM' }}
+  TRIVY_IGNORE_UNFIXED: ${{ vars.TRIVY_IGNORE_UNFIXED || 'false' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Require a lockfile
+        run: |
+          if [ ! -f package-lock.json ]; then
+            echo "::error::package-lock.json is required. Commit the lockfile. This workflow uses npm ci."
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (eslint --fix fixes style issues)
+        id: lint
+        run: |
+          if node -e 'const p=require("./package.json"); process.exit(p.scripts && p.scripts.lint ? 0 : 1)'; then
+            npm run lint
+          elif [ -f eslint.config.js ] || [ -f eslint.config.mjs ] || [ -f eslint.config.cjs ] || [ -f .eslintrc ] || [ -f .eslintrc.js ] || [ -f .eslintrc.cjs ] || [ -f .eslintrc.json ] || [ -f .eslintrc.yml ] || [ -f .eslintrc.yaml ]; then
+            npx eslint .
+          else
+            echo "::error::No lint script and no ESLint config. Add a lint script, or copy templates/node/eslint.config.mjs to eslint.config.mjs."
+            exit 1
+          fi
+
+      - name: Security lint (eslint errors block, npm audit high blocks)
+        id: security
+        run: |
+          dir="$RUNNER_TEMP/eslint-sec"
+          mkdir -p "$dir"
+          npm install --prefix "$dir" --ignore-scripts --no-fund --no-audit \
+            eslint@9.39.5 eslint-plugin-security@4.2.0
+          cat > "$dir/eslint.config.mjs" <<'EOF'
+          import security from "eslint-plugin-security";
+
+          export default [
+            {
+              ignores: ["**/node_modules/**", "**/dist/**", "**/coverage/**"],
+            },
+            security.configs.recommended,
+            {
+              rules: {
+                "security/detect-bidi-characters": "error",
+                "security/detect-buffer-noassert": "error",
+                "security/detect-child-process": "error",
+                "security/detect-disable-mustache-escape": "error",
+                "security/detect-eval-with-expression": "error",
+                "security/detect-invisible-characters": "error",
+                "security/detect-new-buffer": "error",
+                "security/detect-non-literal-require": "error",
+              },
+            },
+          ];
+          EOF
+          "$dir/node_modules/.bin/eslint" --config "$dir/eslint.config.mjs" .
+          npm audit --audit-level=high
+
+      - name: npm audit moderate (warning)
+        if: success()
+        continue-on-error: true
+        run: |
+          if npm audit --audit-level=moderate; then
+            echo "No moderate vulnerabilities."
+          else
+            echo "::warning::npm audit reported moderate vulnerabilities. High and critical already block the previous step."
+            exit 1
+          fi
+
+      - name: Test
+        id: test
+        env:
+          COVERAGE_MIN: ${{ vars.COVERAGE_MIN || '70' }}
+          COVERAGE_SOURCE: ${{ vars.COVERAGE_SOURCE || 'src' }}
+        run: |
+          if [ ! -d "$COVERAGE_SOURCE" ]; then
+            echo "::error::Coverage source '$COVERAGE_SOURCE' does not exist. Add that directory or set the COVERAGE_SOURCE repository variable."
+            exit 1
+          fi
+          echo "Tests must cover ${COVERAGE_SOURCE}. Minimum is ${COVERAGE_MIN}%."
+          runner=$(node <<'JS'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies);
+          const script = (pkg.scripts && pkg.scripts.test) || "";
+          const placeholder = script.includes("no test specified");
+          if (deps.jest) process.stdout.write("jest");
+          else if (deps.mocha) process.stdout.write("mocha");
+          else if (script && !placeholder) process.stdout.write("npm-test");
+          else process.stdout.write("none");
+          JS
+          )
+          case "$runner" in
+            jest)
+              npx jest --ci --coverage --coverageReporters=text --coverageReporters=lcov \
+                --collectCoverageFrom="${COVERAGE_SOURCE}/**/*.{js,jsx,ts,tsx}" \
+                --coverageThreshold="{\"global\":{\"lines\":${COVERAGE_MIN}}}"
+              ;;
+            mocha|npm-test)
+              if ! npx --no-install c8 --version >/dev/null 2>&1; then
+                npm install --no-save --ignore-scripts --package-lock=false "c8@12.0.0"
+              fi
+              if [ "$runner" = "mocha" ]; then
+                npx c8 --reporter=text --reporter=lcov --check-coverage --lines "$COVERAGE_MIN" \
+                  --include "${COVERAGE_SOURCE}/**" mocha
+              else
+                npx c8 --reporter=text --reporter=lcov --check-coverage --lines "$COVERAGE_MIN" \
+                  --include "${COVERAGE_SOURCE}/**" npm test
+              fi
+              ;;
+            *)
+              echo "::error::No jest, mocha, or test script. Add one. Coverage minimum is ${COVERAGE_MIN}%."
+              exit 1
+              ;;
+          esac
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: MEDIUM,HIGH,CRITICAL
+          format: json
+          output: trivy-fs.json
+          exit-code: "0"
+          skip-dirs: .git,vendor,.terraform,.venv,node_modules
+          ignore-unfixed: ${{ env.TRIVY_IGNORE_UNFIXED }}
+          version: v0.70.0
+
+      - name: Enforce Trivy severity
+        id: trivy
+        env:
+          TRIVY_REPORT: trivy-fs.json
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          fail = {s.strip().upper() for s in os.environ.get("TRIVY_FAIL_SEVERITY", "CRITICAL,HIGH").split(",") if s.strip()}
+          warn = {s.strip().upper() for s in os.environ.get("TRIVY_WARN_SEVERITY", "MEDIUM").split(",") if s.strip()}
+          path = os.environ.get("TRIVY_REPORT", "trivy.json")
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  report = json.load(handle)
+          except FileNotFoundError:
+              print(f"::error::Trivy did not write {path}")
+              sys.exit(1)
+          except json.JSONDecodeError as exc:
+              print(f"::error::Trivy report is not JSON: {exc}")
+              sys.exit(1)
+
+          if isinstance(report, dict):
+              results = report.get("Results") or []
+          elif isinstance(report, list):
+              results = report
+          else:
+              results = []
+
+          blocking = []
+          warnings = []
+          for result in results:
+              target = result.get("Target", "")
+              for vuln in result.get("Vulnerabilities") or []:
+                  sev = (vuln.get("Severity") or "").upper()
+                  line = f"{sev} {vuln.get('VulnerabilityID', '')} {vuln.get('PkgName', '')} ({target})"
+                  if sev in fail:
+                      blocking.append(line)
+                  elif sev in warn:
+                      warnings.append(line)
+              for secret in result.get("Secrets") or []:
+                  title = secret.get("Title") or secret.get("RuleID") or "secret"
+                  sev = (secret.get("Severity") or "HIGH").upper()
+                  blocking.append(f"secret {sev} {title} ({target})")
+
+          for line in warnings:
+              print(f"::warning::{line}")
+          for line in blocking:
+              print(f"::error::{line}")
+          if not blocking and not warnings:
+              print("Trivy found nothing at medium or above. A clean scan on a project with no dependency manifest is a pass.")
+          if blocking:
+              sys.exit(1)
+          PY
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage/lcov.info
+          if-no-files-found: warn
+
+      - name: Comment on the pull request
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          SECURITY_OUTCOME: ${{ steps.security.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const marker = "<!-- secure-ci-templates:ci -->";
+            const body = [
+              marker,
+              "## CI",
+              "",
+              "| Step | Result |",
+              "| --- | --- |",
+              `| Lint | ${process.env.LINT_OUTCOME} |`,
+              `| Security | ${process.env.SECURITY_OUTCOME} |`,
+              `| Test | ${process.env.TEST_OUTCOME} |`,
+              `| Trivy | ${process.env.TRIVY_OUTCOME} |`,
+              "",
+              `[Run](${process.env.RUN_URL})`,
+            ].join("\n");
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => (comment.body || "").includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  codeql:
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/reusable-codeql.yml
+    with:
+      language: javascript-typescript
