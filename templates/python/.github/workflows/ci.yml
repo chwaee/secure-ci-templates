@@ -71,8 +71,8 @@ jobs:
             python -m pip install -r requirements.txt
           fi
           if [ -f pyproject.toml ] || [ -f setup.py ]; then
-            echo "Installing the project. pyproject.toml or setup.py must be pip-installable."
-            python -m pip install .
+            echo "Installing the project in editable mode so coverage measures the source tree."
+            python -m pip install -e .
           fi
 
       - name: Lint (ruff check --fix and ruff format fix this)

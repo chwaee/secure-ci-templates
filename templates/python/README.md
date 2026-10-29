@@ -10,7 +10,7 @@ Python 3.12 is the default. That is conservative for compatibility with client c
 
 - `requirements.txt` or `pyproject.toml` at the repository root, so pip can be cached.
 - A `src/` directory, unless you set `COVERAGE_SOURCE`.
-- `pyproject.toml` or `setup.py`, when present, must be pip-installable.
+- `pyproject.toml` or `setup.py`, when present, must be pip-installable. CI installs it with `pip install -e .` so coverage measures `COVERAGE_SOURCE` instead of a copy in site-packages.
 - Tests that pytest can collect. Coverage is measured on `COVERAGE_SOURCE` and fails under `COVERAGE_MIN` (default 70).
 - For ECS or Lambda: an AWS OIDC role and the GitHub environments below. No access keys.
 
