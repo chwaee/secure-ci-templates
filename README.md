@@ -6,7 +6,16 @@ This is not a framework. Nothing here is imported. The workflows are files you c
 
 Author: Chwaee ([chwaee](https://github.com/chwaee), hello@appliedaiconsulting.io). License: MIT.
 
-This sits next to [HarderAWS](https://github.com/chwaee/HarderAWS), the account hardening modules, and [aws-health-audit](https://github.com/chwaee/aws-health-audit), the read-only account audit. HarderAWS builds the account. These workflows build and ship the application. aws-health-audit checks what is already there.
+This sits next to [HarderAWS](https://github.com/chwaee/HarderAWS), the account hardening modules, [aws-health-audit](https://github.com/chwaee/aws-health-audit), the read-only account audit, and [tf-cost-preview](https://github.com/chwaee/tf-cost-preview), the pre-apply cost estimator. HarderAWS builds the account. These workflows build and ship the application. aws-health-audit checks what is already there. tf-cost-preview tells you what the plan will cost.
+
+## Related tools
+
+| Tool | Use it for |
+| --- | --- |
+| [HarderAWS](https://github.com/chwaee/HarderAWS) | AWS security hardening Terraform |
+| [aws-health-audit](https://github.com/chwaee/aws-health-audit) | Read-only AWS account audit |
+| [tf-cost-preview](https://github.com/chwaee/tf-cost-preview) | Estimate Terraform plan costs |
+| [appliedaiconsulting.io](https://appliedaiconsulting.io) | Consulting services |
 
 ## Templates
 
